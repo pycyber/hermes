@@ -18,7 +18,7 @@ use serde_derive::{Deserialize, Serialize};
 use tendermint_light_client_verifier::types::TrustThreshold;
 
 use ibc_relayer_types::core::ics23_commitment::specs::ProofSpecs;
-use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ChannelId, PortId};
+use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ChannelId, PortChannelId, PortId};
 use ibc_relayer_types::timestamp::ZERO_DURATION;
 
 use crate::chain::ChainType;
@@ -385,6 +385,7 @@ pub struct ChainConfig {
     pub store_prefix: String,
     pub default_gas: Option<u64>,
     pub max_gas: Option<u64>,
+    pub ignore_port_channel: Vec<PortChannelId>,
 
     // This field is deprecated, use `gas_multiplier` instead
     pub gas_adjustment: Option<f64>,
