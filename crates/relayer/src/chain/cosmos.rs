@@ -655,6 +655,7 @@ impl ChainEndpoint for CosmosSdkChain {
             self.config.id.clone(),
             self.config.websocket_addr.clone(),
             rt,
+            self.config.ignore_port_channel.clone(),
         )
         .map_err(Error::event_monitor)?;
 
