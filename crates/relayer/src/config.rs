@@ -106,6 +106,10 @@ pub mod default {
         100
     }
 
+    pub fn packet_delay() -> Duration {
+        Duration::ZERO
+    }
+
     pub fn rpc_timeout() -> Duration {
         Duration::from_secs(10)
     }
@@ -295,6 +299,8 @@ impl Display for LogLevel {
 #[serde(default, deny_unknown_fields)]
 pub struct GlobalConfig {
     pub log_level: LogLevel,
+    #[serde(default = "default::packet_delay", with = "humantime_serde")]
+    pub packet_delay: Duration,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
