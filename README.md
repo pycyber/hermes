@@ -40,6 +40,11 @@ The repository also includes [TLA+ specifications](docs/spec).
   add a config named 'ignore_port_channel' in chain config that recieve a list of destination port and channel id to ignore 
   
   e.g. ignore_port_channel = [{ channel_id = 'channel-64', port_id = 'oracle'}] 
+- **Add a global config that delay the packet sending used for backup hermes**
+  
+  add a config named 'packet_delay' in global config that received the duration.
+
+  e.g. packet_delay = '10s'
 
 ## Status
 
