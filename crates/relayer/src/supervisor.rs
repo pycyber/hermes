@@ -195,14 +195,12 @@ fn spawn_batch_workers<Chain: ChainHandle>(
             Some(Duration::from_millis(5)),
             move || -> Result<Next, TaskError<Infallible>> {
                 let mut batches: Vec<ArcBatch> = vec![];
-                loop {
-                    if let Ok(batch) = subscription.try_recv() {
-                        batches.push(batch);
-                    } else {
-                        break;
-                    }
+                while let Ok(batch) = subscription.try_recv() {
+                    batches.push(batch);
                 }
-                thread::sleep(config.global.packet_delay);
+                if !batches.is_empty() {
+                    thread::sleep(config.global.packet_delay);
+                }
                 for batch in batches {
                     handle_batch(
                         &config,
