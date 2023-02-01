@@ -116,7 +116,7 @@ use super::{ibc_event_try_from_abci_event, IbcEventWithHeight};
 pub fn get_all_events(
     chain_id: &ChainId,
     result: RpcEvent,
-    ignore_port_channel: &Vec<PortChannelId>,
+    ignore_port_channel: &[PortChannelId],
 ) -> Result<Vec<IbcEventWithHeight>, String> {
     let mut events_with_height: Vec<IbcEventWithHeight> = vec![];
     let RpcEvent {
