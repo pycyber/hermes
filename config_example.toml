@@ -29,6 +29,7 @@ misbehaviour = true
 # Whether or not to enable the connection workers for handshake completion. [Required]
 enabled = true
 
+
 # Specify the channels mode.
 [mode.channels]
 
