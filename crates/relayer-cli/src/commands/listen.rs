@@ -149,6 +149,7 @@ fn subscribe(
         chain_config.id.clone(),
         chain_config.websocket_addr.clone(),
         rt,
+        chain_config.ignore_port_channel.clone(),
     )
     .map_err(|e| eyre!("could not initialize event monitor: {}", e))?;
 
