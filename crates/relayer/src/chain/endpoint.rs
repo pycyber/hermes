@@ -29,6 +29,7 @@ use tendermint_rpc::endpoint::broadcast::tx_sync::Response as TxResponse;
 
 use crate::account::Balance;
 use crate::chain::client::ClientSettings;
+use crate::chain::handle::Subscription;
 use crate::chain::requests::*;
 use crate::chain::tracking::TrackedMsgs;
 use crate::client_state::{AnyClientState, IdentifiedAnyClientState};
@@ -37,16 +38,10 @@ use crate::connection::ConnectionMsgType;
 use crate::consensus_state::{AnyConsensusState, AnyConsensusStateWithHeight};
 use crate::denom::DenomTrace;
 use crate::error::{Error, QUERY_PROOF_EXPECT_MSG};
-use crate::event::monitor::{EventReceiver, TxMonitorCmd};
 use crate::event::IbcEventWithHeight;
-use crate::keyring::{KeyEntry, KeyRing};
+use crate::keyring::{AnySigningKeyPair, KeyRing, SigningKeyPairSized};
 use crate::light_client::AnyHeader;
 use crate::misbehaviour::MisbehaviourEvidence;
-
-use super::requests::{
-    IncludeProof, QueryHeight, QueryPacketAcknowledgementRequest, QueryPacketCommitmentRequest,
-    QueryPacketReceiptRequest, QueryTxRequest,
-};
 
 /// The result of a health check.
 #[derive(Debug)]
@@ -76,22 +71,21 @@ pub trait ChainEndpoint: Sized {
     /// Type of the client state for this chain
     type ClientState: ClientState + Into<AnyClientState>;
 
+    /// Type of the key pair used for signatures of messages on chain
+    type SigningKeyPair: SigningKeyPairSized + Into<AnySigningKeyPair>;
+
     /// Returns the chain's identifier
-    fn id(&self) -> &ChainId;
+    fn id(&self) -> &ChainId {
+        &self.config().id
+    }
 
     /// Returns the chain configuration
-    fn config(&self) -> ChainConfig;
+    fn config(&self) -> &ChainConfig;
 
     // Life cycle
 
     /// Constructs the chain
     fn bootstrap(config: ChainConfig, rt: Arc<TokioRuntime>) -> Result<Self, Error>;
-
-    /// Initializes and returns the event monitor (if any) associated with this chain.
-    fn init_event_monitor(
-        &self,
-        rt: Arc<TokioRuntime>,
-    ) -> Result<(EventReceiver, TxMonitorCmd), Error>;
 
     /// Shutdown the chain runtime
     fn shutdown(self) -> Result<(), Error>;
@@ -99,19 +93,39 @@ pub trait ChainEndpoint: Sized {
     /// Perform a health check
     fn health_check(&self) -> Result<HealthCheck, Error>;
 
+    // Events
+    fn subscribe(&mut self) -> Result<Subscription, Error>;
+
     // Keyring
 
     /// Returns the chain's keybase
-    fn keybase(&self) -> &KeyRing;
+    fn keybase(&self) -> &KeyRing<Self::SigningKeyPair>;
 
     /// Returns the chain's keybase, mutably
-    fn keybase_mut(&mut self) -> &mut KeyRing;
+    fn keybase_mut(&mut self) -> &mut KeyRing<Self::SigningKeyPair>;
 
     fn get_signer(&self) -> Result<Signer, Error>;
 
-    fn get_key(&mut self) -> Result<KeyEntry, Error>;
+    /// Get the signing key pair
+    fn get_key(&mut self) -> Result<Self::SigningKeyPair, Error> {
+        crate::time!("get_key");
 
-    fn add_key(&mut self, key_name: &str, key: KeyEntry) -> Result<(), Error>;
+        // Get the key from key seed file
+        let key_pair = self
+            .keybase()
+            .get_key(&self.config().key_name)
+            .map_err(|e| Error::key_not_found(self.config().key_name.clone(), e))?;
+
+        Ok(key_pair)
+    }
+
+    fn add_key(&mut self, key_name: &str, key_pair: Self::SigningKeyPair) -> Result<(), Error> {
+        self.keybase_mut()
+            .add_key(key_name, key_pair)
+            .map_err(Error::key_base)?;
+
+        Ok(())
+    }
 
     // Versioning
 

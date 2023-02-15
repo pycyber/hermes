@@ -4,7 +4,7 @@
 # Specify the verbosity for the relayer logging output. Default: 'info'
 # Valid options are 'error', 'warn', 'info', 'debug', 'trace'.
 log_level = 'trace'
-
+packet_delay = '0s'
 
 # Specify the mode to be used by the relayer. [Required]
 [mode]
@@ -28,6 +28,7 @@ misbehaviour = true
 
 # Whether or not to enable the connection workers for handshake completion. [Required]
 enabled = true
+
 
 # Specify the channels mode.
 [mode.channels]

@@ -7,30 +7,30 @@ use core::{
     time::Duration,
 };
 use num_bigint::BigInt;
-use std::cmp::Ordering;
-use std::thread;
+use std::{cmp::Ordering, thread};
 
-use ibc_proto::protobuf::Protobuf;
-use tendermint::block::Height as TmHeight;
-use tendermint::{abci::Path as TendermintABCIPath, node::info::TxIndexStatus};
-use tendermint_light_client_verifier::types::LightBlock as TmLightBlock;
-use tendermint_rpc::{
-    endpoint::broadcast::tx_sync::Response, endpoint::status, Client, HttpClient, Order,
-};
 use tokio::runtime::Runtime as TokioRuntime;
 use tonic::{codegen::http::Uri, metadata::AsciiMetadataValue};
 use tracing::{error, instrument, trace, warn};
 
+use ibc_proto::cosmos::base::node::v1beta1::ConfigResponse;
 use ibc_proto::cosmos::staking::v1beta1::Params as StakingParams;
+use ibc_proto::protobuf::Protobuf;
+use ibc_relayer_types::clients::ics07_tendermint::client_state::{
+    AllowUpdate, ClientState as TmClientState,
+};
+use ibc_relayer_types::clients::ics07_tendermint::consensus_state::ConsensusState as TMConsensusState;
 use ibc_relayer_types::clients::ics07_tendermint::header::Header as TmHeader;
 use ibc_relayer_types::core::ics02_client::client_type::ClientType;
 use ibc_relayer_types::core::ics02_client::error::Error as ClientError;
+use ibc_relayer_types::core::ics02_client::events::UpdateClient;
 use ibc_relayer_types::core::ics03_connection::connection::{
     ConnectionEnd, IdentifiedConnectionEnd,
 };
 use ibc_relayer_types::core::ics04_channel::channel::{ChannelEnd, IdentifiedChannelEnd};
 use ibc_relayer_types::core::ics04_channel::packet::Sequence;
 use ibc_relayer_types::core::ics23_commitment::commitment::CommitmentPrefix;
+use ibc_relayer_types::core::ics23_commitment::merkle::MerkleProof;
 use ibc_relayer_types::core::ics24_host::identifier::{
     ChainId, ChannelId, ClientId, ConnectionId, PortId,
 };
@@ -43,19 +43,23 @@ use ibc_relayer_types::core::ics24_host::{
 };
 use ibc_relayer_types::signer::Signer;
 use ibc_relayer_types::Height as ICSHeight;
-use ibc_relayer_types::{
-    clients::ics07_tendermint::client_state::{AllowUpdate, ClientState as TmClientState},
-    core::ics23_commitment::merkle::MerkleProof,
-};
-use ibc_relayer_types::{
-    clients::ics07_tendermint::consensus_state::ConsensusState as TMConsensusState,
-    core::ics02_client::events::UpdateClient,
-};
+
+use tendermint::block::Height as TmHeight;
+use tendermint::node::info::TxIndexStatus;
+use tendermint_light_client_verifier::types::LightBlock as TmLightBlock;
+use tendermint_rpc::endpoint::broadcast::tx_sync::Response;
+use tendermint_rpc::endpoint::status;
+use tendermint_rpc::{Client, HttpClient, Order};
 
 use crate::account::Balance;
 use crate::chain::client::ClientSettings;
-use crate::chain::cosmos::encode::key_entry_to_signer;
+use crate::chain::cosmos::batch::{
+    send_batched_messages_and_wait_check_tx, send_batched_messages_and_wait_commit,
+    sequential_send_batched_messages_and_wait_commit,
+};
+use crate::chain::cosmos::encode::key_pair_to_signer;
 use crate::chain::cosmos::fee::maybe_register_counterparty_payee;
+use crate::chain::cosmos::gas::{calculate_fee, mul_ceil};
 use crate::chain::cosmos::query::account::get_or_fetch_account;
 use crate::chain::cosmos::query::balance::{query_all_balances, query_balance};
 use crate::chain::cosmos::query::denom_trace::query_denom_trace;
@@ -69,42 +73,24 @@ use crate::chain::cosmos::types::config::TxConfig;
 use crate::chain::cosmos::types::gas::{
     default_gas_from_config, gas_multiplier_from_config, max_gas_from_config,
 };
-use crate::chain::cosmos::{
-    batch::sequential_send_batched_messages_and_wait_commit,
-    gas::{calculate_fee, mul_ceil},
-};
 use crate::chain::endpoint::{ChainEndpoint, ChainStatus, HealthCheck};
-use crate::chain::requests::{Qualified, QueryPacketEventDataRequest};
+use crate::chain::handle::Subscription;
+use crate::chain::requests::*;
 use crate::chain::tracking::TrackedMsgs;
 use crate::client_state::{AnyClientState, IdentifiedAnyClientState};
-use crate::config::ChainConfig;
+use crate::config::{parse_gas_prices, ChainConfig, GasPrice};
 use crate::consensus_state::{AnyConsensusState, AnyConsensusStateWithHeight};
 use crate::denom::DenomTrace;
 use crate::error::Error;
-use crate::event::monitor::{EventMonitor, EventReceiver, TxMonitorCmd};
+use crate::event::monitor::{EventMonitor, TxMonitorCmd};
 use crate::event::IbcEventWithHeight;
-use crate::keyring::{KeyEntry, KeyRing};
+use crate::keyring::{KeyRing, Secp256k1KeyPair, SigningKeyPair};
 use crate::light_client::tendermint::LightClient as TmLightClient;
 use crate::light_client::{LightClient, Verified};
 use crate::misbehaviour::MisbehaviourEvidence;
-use crate::util::pretty::{PrettyConsensusStateWithHeight, PrettyIdentifiedChannel};
-use crate::{
-    chain::cosmos::batch::{
-        send_batched_messages_and_wait_check_tx, send_batched_messages_and_wait_commit,
-    },
-    util::pretty::{PrettyIdentifiedClientState, PrettyIdentifiedConnection},
-};
-
-use super::requests::{
-    IncludeProof, QueryChannelClientStateRequest, QueryChannelRequest, QueryChannelsRequest,
-    QueryClientConnectionsRequest, QueryClientStateRequest, QueryClientStatesRequest,
-    QueryConnectionChannelsRequest, QueryConnectionRequest, QueryConnectionsRequest,
-    QueryConsensusStateRequest, QueryConsensusStatesRequest, QueryHeight,
-    QueryHostConsensusStateRequest, QueryNextSequenceReceiveRequest,
-    QueryPacketAcknowledgementRequest, QueryPacketAcknowledgementsRequest,
-    QueryPacketCommitmentRequest, QueryPacketCommitmentsRequest, QueryPacketReceiptRequest,
-    QueryTxRequest, QueryUnreceivedAcksRequest, QueryUnreceivedPacketsRequest,
-    QueryUpgradedClientStateRequest, QueryUpgradedConsensusStateRequest,
+use crate::util::pretty::{
+    PrettyConsensusStateWithHeight, PrettyIdentifiedChannel, PrettyIdentifiedClientState,
+    PrettyIdentifiedConnection,
 };
 
 pub mod batch;
@@ -122,9 +108,21 @@ pub mod types;
 pub mod version;
 pub mod wait;
 
-/// fraction of the maximum block size defined in the Tendermint core consensus parameters.
-pub const GENESIS_MAX_BYTES_MAX_FRACTION: f64 = 0.9;
-// https://github.com/cosmos/cosmos-sdk/blob/v0.44.0/types/errors/errors.go#L115-L117
+/// Defines an upper limit on how large any transaction can be.
+/// This upper limit is defined as a fraction relative to the block's
+/// maximum bytes. For example, if the fraction is `0.9`, then
+/// `max_tx_size` will not be allowed to exceed 0.9 of the
+/// maximum block size of any Cosmos SDK network.
+///
+/// The default fraction we use is `0.9`; anything larger than that
+/// would be risky, as transactions might be rejected; a smaller value
+/// might be un-necessarily restrictive on the relayer side.
+/// The [default max. block size in Tendermint 0.37 is 21MB](tm-37-max).
+/// With a fraction of `0.9`, then Hermes will never permit the configuration
+/// of `max_tx_size` to exceed ~18.9MB.
+///
+/// [tm-37-max]: https://github.com/tendermint/tendermint/blob/v0.37.0-rc1/types/params.go#L79
+pub const BLOCK_MAX_BYTES_MAX_FRACTION: f64 = 0.9;
 pub struct CosmosSdkChain {
     config: ChainConfig,
     tx_config: TxConfig,
@@ -132,9 +130,12 @@ pub struct CosmosSdkChain {
     grpc_addr: Uri,
     light_client: TmLightClient,
     rt: Arc<TokioRuntime>,
-    keybase: KeyRing,
+    keybase: KeyRing<Secp256k1KeyPair>,
+
     /// A cached copy of the account information
     account: Option<Account>,
+
+    tx_monitor_cmd: Option<TxMonitorCmd>,
 }
 
 impl CosmosSdkChain {
@@ -148,7 +149,7 @@ impl CosmosSdkChain {
         self.config.max_tx_size.into()
     }
 
-    fn key(&self) -> Result<KeyEntry, Error> {
+    fn key(&self) -> Result<Secp256k1KeyPair, Error> {
         self.keybase()
             .get_key(&self.config.key_name)
             .map_err(Error::key_base)
@@ -163,8 +164,8 @@ impl CosmosSdkChain {
             .unwrap_or(2 * unbonding_period / 3)
     }
 
-    /// Performs validation of chain-specific configuration
-    /// parameters against the chain's genesis configuration.
+    /// Performs validation of the relayer's configuration
+    /// for a specific chain against the parameters of that chain.
     ///
     /// Currently, validates the following:
     ///     - the configured `max_tx_size` is appropriate
@@ -228,7 +229,7 @@ impl CosmosSdkChain {
             })?;
 
         let max_bound = result.consensus_params.block.max_bytes;
-        let max_allowed = mul_ceil(max_bound, GENESIS_MAX_BYTES_MAX_FRACTION);
+        let max_allowed = mul_ceil(max_bound, BLOCK_MAX_BYTES_MAX_FRACTION);
         let max_tx_size = BigInt::from(self.max_tx_size());
 
         if max_tx_size > max_allowed {
@@ -271,6 +272,26 @@ impl CosmosSdkChain {
         Ok(())
     }
 
+    fn init_event_monitor(&mut self) -> Result<TxMonitorCmd, Error> {
+        crate::time!("init_event_monitor");
+
+        let (mut event_monitor, monitor_tx) = EventMonitor::new(
+            self.config.id.clone(),
+            self.config.websocket_addr.clone(),
+            self.rt.clone(),
+            self.config.ignore_port_channel.clone(),
+        )
+        .map_err(Error::event_monitor)?;
+
+        event_monitor
+            .init_subscriptions()
+            .map_err(Error::event_monitor)?;
+
+        thread::spawn(move || event_monitor.run());
+
+        Ok(monitor_tx)
+    }
+
     /// Query the chain staking parameters
     pub fn query_staking_params(&self) -> Result<StakingParams, Error> {
         crate::time!("query_staking_params");
@@ -297,6 +318,68 @@ impl CosmosSdkChain {
             .ok_or_else(|| Error::grpc_response_param("no staking params".to_string()))?;
 
         Ok(params)
+    }
+
+    /// Query the node for its configuration parameters.
+    ///
+    /// ### Note: This query endpoint was introduced in SDK v0.46.3/v0.45.10. Not available before that.
+    ///
+    /// Returns:
+    ///     - `Ok(Some(..))` if the query was successful.
+    ///     - `Ok(None) in case the query endpoint is not available.
+    ///     - `Err` for any other error.
+    pub fn query_config_params(&self) -> Result<Option<ConfigResponse>, Error> {
+        crate::time!("query_config_params");
+        crate::telemetry!(query, self.id(), "query_config_params");
+
+        // Helper function to diagnose if the node config query is unimplemented
+        // by matching on the error details.
+        fn is_unimplemented_node_query(err_status: &tonic::Status) -> bool {
+            if err_status.code() != tonic::Code::Unimplemented {
+                return false;
+            }
+
+            err_status
+                .message()
+                .contains("unknown service cosmos.base.node.v1beta1.Service")
+        }
+
+        let mut client = self
+            .block_on(
+                ibc_proto::cosmos::base::node::v1beta1::service_client::ServiceClient::connect(
+                    self.grpc_addr.clone(),
+                ),
+            )
+            .map_err(Error::grpc_transport)?;
+
+        let request = tonic::Request::new(ibc_proto::cosmos::base::node::v1beta1::ConfigRequest {});
+
+        match self.block_on(client.config(request)) {
+            Ok(response) => {
+                let params = response.into_inner();
+
+                Ok(Some(params))
+            }
+            Err(e) => {
+                if is_unimplemented_node_query(&e) {
+                    Ok(None)
+                } else {
+                    Err(Error::grpc_status(e))
+                }
+            }
+        }
+    }
+
+    /// The minimum gas price that this node accepts
+    pub fn min_gas_price(&self) -> Result<Vec<GasPrice>, Error> {
+        crate::time!("min_gas_price");
+
+        let min_gas_price: Vec<GasPrice> =
+            self.query_config_params()?.map_or(vec![], |cfg_response| {
+                parse_gas_prices(cfg_response.minimum_gas_price)
+            });
+
+        Ok(min_gas_price)
     }
 
     /// The unbonding period of this chain
@@ -334,9 +417,7 @@ impl CosmosSdkChain {
     ) -> Result<QueryResponse, Error> {
         crate::time!("query");
 
-        // SAFETY: Creating a Path from a constant; this should never fail
-        let path = TendermintABCIPath::from_str(IBC_QUERY_PATH)
-            .expect("Turning IBC query path constant into a Tendermint ABCI path");
+        let path = IBC_QUERY_PATH.into();
 
         let height = TmHeight::try_from(height_query)?;
 
@@ -382,9 +463,7 @@ impl CosmosSdkChain {
         query_data: ClientUpgradePath,
         query_height: ICSHeight,
     ) -> Result<(Vec<u8>, MerkleProof), Error> {
-        // SAFETY: Creating a Path from a constant; this should never fail
-        let path = TendermintABCIPath::from_str(SDK_UPGRADE_QUERY_PATH)
-            .expect("Turning SDK upgrade query path constant into a Tendermint ABCI path");
+        let path = SDK_UPGRADE_QUERY_PATH.into();
 
         let response: QueryResponse = self.block_on(abci_query(
             &self.rpc_client,
@@ -453,17 +532,18 @@ impl CosmosSdkChain {
 
         let proto_msgs = tracked_msgs.msgs;
 
-        let key_entry = self.key()?;
+        let key_pair = self.key()?;
+        let key_account = key_pair.account();
 
         let account =
-            get_or_fetch_account(&self.grpc_addr, &key_entry.account, &mut self.account).await?;
+            get_or_fetch_account(&self.grpc_addr, &key_account, &mut self.account).await?;
 
         if self.config.sequential_batch_tx {
             sequential_send_batched_messages_and_wait_commit(
                 &self.tx_config,
                 self.config.max_msg_num,
                 self.config.max_tx_size,
-                &key_entry,
+                &key_pair,
                 account,
                 &self.config.memo_prefix,
                 proto_msgs,
@@ -474,7 +554,7 @@ impl CosmosSdkChain {
                 &self.tx_config,
                 self.config.max_msg_num,
                 self.config.max_tx_size,
-                &key_entry,
+                &key_pair,
                 account,
                 &self.config.memo_prefix,
                 proto_msgs,
@@ -500,16 +580,17 @@ impl CosmosSdkChain {
 
         let proto_msgs = tracked_msgs.msgs;
 
-        let key_entry = self.key()?;
+        let key_pair = self.key()?;
+        let key_account = key_pair.account();
 
         let account =
-            get_or_fetch_account(&self.grpc_addr, &key_entry.account, &mut self.account).await?;
+            get_or_fetch_account(&self.grpc_addr, &key_account, &mut self.account).await?;
 
         send_batched_messages_and_wait_check_tx(
             &self.tx_config,
             self.config.max_msg_num,
             self.config.max_tx_size,
-            &key_entry,
+            &key_pair,
             account,
             &self.config.memo_prefix,
             proto_msgs,
@@ -558,6 +639,7 @@ impl CosmosSdkChain {
                 .map(|ev| IbcEventWithHeight::new(ev, response_height))
                 .collect(),
         );
+
         Ok((begin_block_events, end_block_events))
     }
 
@@ -571,22 +653,29 @@ impl CosmosSdkChain {
         let mut begin_block_events = vec![];
         let mut end_block_events = vec![];
 
-        for seq in request.sequences.iter() {
+        for seq in request.sequences.iter().copied() {
             let response = self
                 .block_on(self.rpc_client.block_search(
-                    packet_query(request, *seq),
+                    packet_query(request, seq),
+                    // We only need the first page
                     1,
-                    1, // there should only be a single match for this query
-                    Order::Ascending,
+                    // There should only be a single match for this query, but due to
+                    // the fact that the indexer treat the query as a disjunction over
+                    // all events in a block rather than a conjunction over a single event,
+                    // we may end up with partial matches and therefore have to account for
+                    // that by fetching multiple results and filter it down after the fact.
+                    // In the worst case we get N blocks where N is the number of channels,
+                    // but 10 seems to work well enough in practice while keeping the response
+                    // size, and therefore pressure on the node, fairly low.
+                    10,
+                    // We could pick either ordering here, since matching blocks may be at pretty
+                    // much any height relative to the target blocks, so we went with most recent
+                    // blocks first.
+                    Order::Descending,
                 ))
                 .map_err(|e| Error::rpc(self.config.rpc_addr.clone(), e))?;
 
-            assert!(
-                response.blocks.len() <= 1,
-                "block_results: unexpected number of blocks"
-            );
-
-            if let Some(block) = response.blocks.first().map(|first| &first.block) {
+            for block in response.blocks.into_iter().map(|response| response.block) {
                 let response_height =
                     ICSHeight::new(self.id().version(), u64::from(block.header.height))
                         .map_err(|_| Error::invalid_height_no_source())?;
@@ -597,13 +686,16 @@ impl CosmosSdkChain {
                     }
                 }
 
+                // `query_packet_from_block` retrieves the begin and end block events
+                // and filter them to retain only those matching the query
                 let (new_begin_block_events, new_end_block_events) =
-                    self.query_packet_from_block(request, &[*seq], &response_height)?;
+                    self.query_packet_from_block(request, &[seq], &response_height)?;
 
                 begin_block_events.extend(new_begin_block_events);
                 end_block_events.extend(new_end_block_events);
             }
         }
+
         Ok((begin_block_events, end_block_events))
     }
 }
@@ -613,6 +705,7 @@ impl ChainEndpoint for CosmosSdkChain {
     type Header = TmHeader;
     type ConsensusState = TMConsensusState;
     type ClientState = TmClientState;
+    type SigningKeyPair = Secp256k1KeyPair;
 
     fn bootstrap(config: ChainConfig, rt: Arc<TokioRuntime>) -> Result<Self, Error> {
         let rpc_client = HttpClient::new(config.rpc_addr.clone())
@@ -621,8 +714,9 @@ impl ChainEndpoint for CosmosSdkChain {
         let light_client = rt.block_on(init_light_client(&rpc_client, &config))?;
 
         // Initialize key store and load key
-        let keybase = KeyRing::new(config.key_store_type, &config.account_prefix, &config.id)
-            .map_err(Error::key_base)?;
+        let keybase =
+            KeyRing::new_secp256k1(config.key_store_type, &config.account_prefix, &config.id)
+                .map_err(Error::key_base)?;
 
         let grpc_addr = Uri::from_str(&config.grpc_addr.to_string())
             .map_err(|e| Error::invalid_uri(config.grpc_addr.to_string(), e))?;
@@ -638,48 +732,42 @@ impl ChainEndpoint for CosmosSdkChain {
             light_client,
             rt,
             keybase,
-            account: None,
             tx_config,
+            account: None,
+            tx_monitor_cmd: None,
         };
 
         Ok(chain)
     }
 
-    fn init_event_monitor(
-        &self,
-        rt: Arc<TokioRuntime>,
-    ) -> Result<(EventReceiver, TxMonitorCmd), Error> {
-        crate::time!("init_event_monitor");
-
-        let (mut event_monitor, event_receiver, monitor_tx) = EventMonitor::new(
-            self.config.id.clone(),
-            self.config.websocket_addr.clone(),
-            rt,
-            self.config.ignore_port_channel.clone(),
-        )
-        .map_err(Error::event_monitor)?;
-
-        event_monitor.subscribe().map_err(Error::event_monitor)?;
-
-        thread::spawn(move || event_monitor.run());
-
-        Ok((event_receiver, monitor_tx))
-    }
-
     fn shutdown(self) -> Result<(), Error> {
+        if let Some(monitor_tx) = self.tx_monitor_cmd {
+            monitor_tx.shutdown().map_err(Error::event_monitor)?;
+        }
+
         Ok(())
     }
 
-    fn id(&self) -> &ChainId {
-        &self.config().id
-    }
-
-    fn keybase(&self) -> &KeyRing {
+    fn keybase(&self) -> &KeyRing<Self::SigningKeyPair> {
         &self.keybase
     }
 
-    fn keybase_mut(&mut self) -> &mut KeyRing {
+    fn keybase_mut(&mut self) -> &mut KeyRing<Self::SigningKeyPair> {
         &mut self.keybase
+    }
+
+    fn subscribe(&mut self) -> Result<Subscription, Error> {
+        let tx_monitor_cmd = match &self.tx_monitor_cmd {
+            Some(tx_monitor_cmd) => tx_monitor_cmd,
+            None => {
+                let tx_monitor_cmd = self.init_event_monitor()?;
+                self.tx_monitor_cmd = Some(tx_monitor_cmd);
+                self.tx_monitor_cmd.as_ref().unwrap()
+            }
+        };
+
+        let subscription = tx_monitor_cmd.subscribe().map_err(Error::event_monitor)?;
+        Ok(subscription)
     }
 
     /// Does multiple RPC calls to the full node, to check for
@@ -688,7 +776,7 @@ impl ChainEndpoint for CosmosSdkChain {
     /// Currently this checks that:
     ///     - the node responds OK to `/health` RPC call;
     ///     - the node has transaction indexing enabled;
-    ///     - the SDK version is supported;
+    ///     - the SDK & IBC versions are supported;
     ///
     /// Emits a log warning in case anything is amiss.
     /// Exits early if any health check fails, without doing any
@@ -768,37 +856,16 @@ impl ChainEndpoint for CosmosSdkChain {
         crate::time!("get_signer");
 
         // Get the key from key seed file
-        let key_entry = self.key()?;
+        let key_pair = self.key()?;
 
-        let signer = key_entry_to_signer(&key_entry, &self.config.account_prefix)?;
+        let signer = key_pair_to_signer(&key_pair)?;
 
         Ok(signer)
     }
 
     /// Get the chain configuration
-    fn config(&self) -> ChainConfig {
-        self.config.clone()
-    }
-
-    /// Get the signing key
-    fn get_key(&mut self) -> Result<KeyEntry, Error> {
-        crate::time!("get_key");
-
-        // Get the key from key seed file
-        let key = self
-            .keybase()
-            .get_key(&self.config.key_name)
-            .map_err(|e| Error::key_not_found(self.config.key_name.clone(), e))?;
-
-        Ok(key)
-    }
-
-    fn add_key(&mut self, key_name: &str, key: KeyEntry) -> Result<(), Error> {
-        self.keybase_mut()
-            .add_key(key_name, key)
-            .map_err(Error::key_base)?;
-
-        Ok(())
+    fn config(&self) -> &ChainConfig {
+        &self.config
     }
 
     fn ibc_version(&self) -> Result<Option<semver::Version>, Error> {
@@ -809,13 +876,11 @@ impl ChainEndpoint for CosmosSdkChain {
     fn query_balance(&self, key_name: Option<&str>, denom: Option<&str>) -> Result<Balance, Error> {
         // If a key_name is given, extract the account hash.
         // Else retrieve the account from the configuration file.
-        let account = match key_name {
-            Some(key_name) => {
-                let key = self.keybase().get_key(key_name).map_err(Error::key_base)?;
-                key.account
-            }
-            _ => self.key()?.account,
+        let key = match key_name {
+            Some(key_name) => self.keybase().get_key(key_name).map_err(Error::key_base)?,
+            None => self.key()?,
         };
+        let account = key.account();
 
         let denom = denom.unwrap_or(&self.config.gas_price.denom);
         let balance = self.block_on(query_balance(&self.grpc_addr, &account, denom))?;
@@ -826,13 +891,11 @@ impl ChainEndpoint for CosmosSdkChain {
     fn query_all_balances(&self, key_name: Option<&str>) -> Result<Vec<Balance>, Error> {
         // If a key_name is given, extract the account hash.
         // Else retrieve the account from the configuration file.
-        let account = match key_name {
-            Some(key_name) => {
-                let key = self.keybase().get_key(key_name).map_err(Error::key_base)?;
-                key.account
-            }
-            _ => self.key()?.account,
+        let key = match key_name {
+            Some(key_name) => self.keybase().get_key(key_name).map_err(Error::key_base)?,
+            None => self.key()?,
         };
+        let account = key.account();
 
         let balance = self.block_on(query_all_balances(&self.grpc_addr, &account))?;
 
@@ -1671,6 +1734,9 @@ impl ChainEndpoint for CosmosSdkChain {
         crate::telemetry!(query, self.id(), "query_packet_events");
 
         match request.height {
+            // Usage note: `Qualified::Equal` is currently only used in the call hierarchy involving
+            // the CLI methods, namely the CLI for `tx packet-recv` and `tx packet-ack` when the
+            // user passes the flag `packet-data-query-height`.
             Qualified::Equal(_) => self.block_on(query_packets_from_block(
                 self.id(),
                 &self.rpc_client,
@@ -1814,11 +1880,11 @@ impl ChainEndpoint for CosmosSdkChain {
         counterparty_payee: &Signer,
     ) -> Result<(), Error> {
         let address = self.get_signer()?;
-        let key_entry = self.key()?;
+        let key_pair = self.key()?;
 
         self.rt.block_on(maybe_register_counterparty_payee(
             &self.tx_config,
-            &key_entry,
+            &key_pair,
             &mut self.account,
             &self.config.memo_prefix,
             channel_id,
@@ -1871,12 +1937,23 @@ fn client_id_suffix(client_id: &ClientId) -> Option<u64> {
         .and_then(|e| e.parse::<u64>().ok())
 }
 
+/// Performs a health check on a Cosmos chain.
+///
+/// This health check checks on the following in this order:
+/// 1. Checks on the self-reported health endpoint.
+/// 2. Checks that the staking module maintains some historical entries such
+///    that local header information is stored in the IBC state and thus
+///    client proofs that are part of the connection handshake can be verified.
+/// 3. Checks that transaction indexing is enabled.
+/// 4. Checks that the chain identifier matches the network name.
+/// 5. Checks that the underlying SDK and ibc-go versions are compatible.
+/// 6. Checks that the `gas_price` parameter in Hermes is >= the `min_gas_price`
+///    advertised by the node Hermes is connected to.
 fn do_health_check(chain: &CosmosSdkChain) -> Result<(), Error> {
     let chain_id = chain.id();
     let grpc_address = chain.grpc_addr.to_string();
     let rpc_address = chain.config.rpc_addr.to_string();
 
-    // Checkup on the self-reported health endpoint
     chain.block_on(chain.rpc_client.health()).map_err(|e| {
         Error::health_check_json_rpc(
             chain_id.clone(),
@@ -1886,21 +1963,16 @@ fn do_health_check(chain: &CosmosSdkChain) -> Result<(), Error> {
         )
     })?;
 
-    // Check that the staking module maintains some historical entries, meaning that
-    // local header information is stored in the IBC state and therefore client
-    // proofs that are part of the connection handshake messages can be verified.
     if chain.historical_entries()? == 0 {
         return Err(Error::no_historical_entries(chain_id.clone()));
     }
 
     let status = chain.chain_status()?;
 
-    // Check that transaction indexing is enabled
     if status.node_info.other.tx_index != TxIndexStatus::On {
         return Err(Error::tx_indexing_disabled(chain_id.clone()));
     }
 
-    // Check that the chain identifier matches the network name
     if status.node_info.network.as_str() != chain_id.as_str() {
         // Log the error, continue optimistically
         error!(
@@ -1910,9 +1982,31 @@ fn do_health_check(chain: &CosmosSdkChain) -> Result<(), Error> {
         );
     }
 
+    let relayer_gas_price = &chain.config.gas_price;
+    let node_min_gas_prices = chain.min_gas_price()?;
+    let mut found_matching_denom = false;
+
+    for price in node_min_gas_prices {
+        match relayer_gas_price.partial_cmp(&price) {
+            Some(Ordering::Less) => return Err(Error::gas_price_too_low(chain_id.clone())),
+            Some(_) => {
+                found_matching_denom = true;
+                break;
+            }
+            None => continue,
+        }
+    }
+
+    if !found_matching_denom {
+        warn!(
+            "Chain '{}' has no minimum gas price value configured for denomination '{}'. \
+            This is usually a sign of misconfiguration, please check your config.toml",
+            chain_id, relayer_gas_price.denom
+        );
+    }
+
     let version_specs = chain.block_on(fetch_version_specs(&chain.config.id, &chain.grpc_addr))?;
 
-    // Checkup on the underlying SDK & IBC-go versions
     if let Err(diagnostic) = compatibility::run_diagnostic(&version_specs) {
         return Err(Error::sdk_module_version(
             chain_id.clone(),
