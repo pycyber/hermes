@@ -327,12 +327,14 @@ impl CosmosSdkChain {
                 self.compat_mode,
                 *batch_delay,
                 self.rt.clone(),
+                self.config.ignore_port_channel.clone(),
             ),
             Mode::Pull { interval } => EventSource::rpc(
                 self.config.id.clone(),
                 self.rpc_client.clone(),
                 *interval,
                 self.rt.clone(),
+                self.config.ignore_port_channel.clone(),
             ),
         }
         .map_err(Error::event_source)?;

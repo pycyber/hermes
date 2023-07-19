@@ -28,7 +28,7 @@ use tendermint_rpc::{Url, WebSocketClientUrl};
 
 use ibc_proto::google::protobuf::Any;
 use ibc_relayer_types::core::ics23_commitment::specs::ProofSpecs;
-use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ChannelId, PortId};
+use ibc_relayer_types::core::ics24_host::identifier::{ChainId, ChannelId, PortChannelId, PortId};
 use ibc_relayer_types::timestamp::ZERO_DURATION;
 
 use crate::chain::ChainType;
@@ -168,6 +168,10 @@ pub mod default {
 
     pub fn clear_packets_interval() -> u64 {
         100
+    }
+
+    pub fn packet_delay() -> Duration {
+        Duration::ZERO
     }
 
     pub fn rpc_timeout() -> Duration {
@@ -398,6 +402,8 @@ impl Display for LogLevel {
 #[serde(default, deny_unknown_fields)]
 pub struct GlobalConfig {
     pub log_level: LogLevel,
+    #[serde(default = "default::packet_delay", with = "humantime_serde")]
+    pub packet_delay: Duration,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -587,6 +593,7 @@ pub struct ChainConfig {
     pub store_prefix: String,
     pub default_gas: Option<u64>,
     pub max_gas: Option<u64>,
+    pub ignore_port_channel: Vec<PortChannelId>,
 
     // This field is only meant to be set via the `update client` command,
     // for when we need to ugprade a client across a genesis restart and

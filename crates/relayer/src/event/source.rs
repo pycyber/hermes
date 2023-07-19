@@ -11,6 +11,7 @@ use tendermint_rpc::{
 };
 use tokio::runtime::Runtime as TokioRuntime;
 
+use ibc_relayer_types::core::ics24_host::identifier::PortChannelId;
 use ibc_relayer_types::{
     core::ics02_client::height::Height, core::ics24_host::identifier::ChainId,
 };
@@ -34,9 +35,16 @@ impl EventSource {
         rpc_compat: CompatMode,
         batch_delay: Duration,
         rt: Arc<TokioRuntime>,
+        ignore_port_channel: Vec<PortChannelId>,
     ) -> Result<(Self, TxEventSourceCmd)> {
-        let (mut source, tx) =
-            websocket::EventSource::new(chain_id, ws_url, rpc_compat, batch_delay, rt)?;
+        let (mut source, tx) = websocket::EventSource::new(
+            chain_id,
+            ws_url,
+            rpc_compat,
+            batch_delay,
+            rt,
+            ignore_port_channel,
+        )?;
 
         source.init_subscriptions()?;
 
@@ -48,8 +56,10 @@ impl EventSource {
         rpc_client: HttpClient,
         poll_interval: Duration,
         rt: Arc<TokioRuntime>,
+        ignore_port_channel: Vec<PortChannelId>,
     ) -> Result<(Self, TxEventSourceCmd)> {
-        let (source, tx) = rpc::EventSource::new(chain_id, rpc_client, poll_interval, rt)?;
+        let (source, tx) =
+            rpc::EventSource::new(chain_id, rpc_client, poll_interval, rt, ignore_port_channel)?;
         Ok((Self::Rpc(source), tx))
     }
 
@@ -115,7 +125,7 @@ pub mod queries {
             ibc_client(),
             ibc_connection(),
             ibc_channel(),
-            ibc_query(),
+            ibc_wasm(),
             // This will be needed when we send misbehavior evidence to full node
             // Query::eq("message.module", "evidence"),
         ]
@@ -139,5 +149,9 @@ pub mod queries {
 
     pub fn ibc_query() -> Query {
         Query::eq("message.module", "interchainquery")
+    }
+
+    pub fn ibc_wasm() -> Query {
+        Query::eq("message.module", "wasm")
     }
 }

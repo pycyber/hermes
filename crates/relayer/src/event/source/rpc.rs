@@ -13,6 +13,7 @@ use tendermint::abci;
 use tendermint::block::Height as BlockHeight;
 use tendermint_rpc::{Client, HttpClient};
 
+use ibc_relayer_types::core::ics24_host::identifier::PortChannelId;
 use ibc_relayer_types::{
     core::{
         ics02_client::{events::NewBlock, height::Height},
@@ -56,6 +57,8 @@ pub struct EventSource {
 
     /// Last fetched block height
     last_fetched_height: BlockHeight,
+
+    ignore_port_channel: Vec<PortChannelId>,
 }
 
 impl EventSource {
@@ -64,6 +67,7 @@ impl EventSource {
         rpc_client: HttpClient,
         poll_interval: Duration,
         rt: Arc<TokioRuntime>,
+        ignore_port_channel: Vec<PortChannelId>,
     ) -> Result<(Self, TxEventSourceCmd)> {
         let event_bus = EventBus::new();
         let (tx_cmd, rx_cmd) = channel::unbounded();
@@ -76,6 +80,7 @@ impl EventSource {
             event_bus,
             rx_cmd,
             last_fetched_height: BlockHeight::from(0_u32),
+            ignore_port_channel,
         };
 
         Ok((source, TxEventSourceCmd(tx_cmd)))
@@ -203,7 +208,13 @@ impl EventSource {
         for height in heights {
             trace!("collecting events at height {height}");
 
-            let result = collect_events(&self.rpc_client, &self.chain_id, height).await;
+            let result = collect_events(
+                &self.rpc_client,
+                &self.chain_id,
+                height,
+                self.ignore_port_channel.clone(),
+            )
+            .await;
 
             match result {
                 Ok(batch) => {
@@ -294,6 +305,7 @@ async fn collect_events(
     rpc_client: &HttpClient,
     chain_id: &ChainId,
     latest_block_height: BlockHeight,
+    ignore_port_channel: Vec<PortChannelId>,
 ) -> Result<Option<EventBatch>> {
     let abci_events = fetch_all_events(rpc_client, latest_block_height).await?;
     trace!("Found {} ABCI events before dedupe", abci_events.len());
@@ -305,7 +317,8 @@ async fn collect_events(
     let new_block_event =
         IbcEventWithHeight::new(IbcEvent::NewBlock(NewBlock::new(height)), height);
 
-    let mut block_events = extract_events(chain_id, height, &abci_events).unwrap_or_default();
+    let mut block_events =
+        extract_events(chain_id, height, &abci_events, ignore_port_channel).unwrap_or_default();
     let mut events = Vec::with_capacity(block_events.len() + 1);
     events.push(new_block_event);
     events.append(&mut block_events);

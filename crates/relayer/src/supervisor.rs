@@ -4,6 +4,7 @@ use core::convert::Infallible;
 use core::ops::Deref;
 use core::time::Duration;
 use std::sync::RwLock;
+use std::thread;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use itertools::Itertools;
@@ -239,7 +240,14 @@ fn spawn_batch_workers<Chain: ChainHandle>(
             error_span!("worker.batch", chain = %chain.id()),
             Some(Duration::from_millis(5)),
             move || -> Result<Next, TaskError<Infallible>> {
-                if let Ok(batch) = subscription.try_recv() {
+                let mut batches: Vec<ArcBatch> = vec![];
+                while let Ok(batch) = subscription.try_recv() {
+                    batches.push(batch);
+                }
+                if !batches.is_empty() {
+                    thread::sleep(config.global.packet_delay);
+                }
+                for batch in batches {
                     handle_batch(
                         &config,
                         &mut registry.write(),
@@ -249,7 +257,6 @@ fn spawn_batch_workers<Chain: ChainHandle>(
                         batch,
                     );
                 }
-
                 Ok(Next::Continue)
             },
         );

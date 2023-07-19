@@ -3,6 +3,7 @@ use tendermint::abci;
 
 use ibc_relayer_types::core::ics02_client::height::Height;
 use ibc_relayer_types::core::ics24_host::identifier::ChainId;
+use ibc_relayer_types::core::ics24_host::identifier::PortChannelId;
 use ibc_relayer_types::events::IbcEvent;
 
 use crate::telemetry;
@@ -13,12 +14,13 @@ pub fn extract_events(
     _chain_id: &ChainId,
     height: Height,
     events: &[abci::Event],
+    ignore_port_channel: Vec<PortChannelId>,
 ) -> Result<Vec<IbcEventWithHeight>, String> {
     let mut events_with_height = vec![];
 
     for abci_event in events {
         match ibc_event_try_from_abci_event(abci_event) {
-            Ok(event) if should_collect_event(&event) => {
+            Ok(event) if should_collect_event(&event, ignore_port_channel.clone()) => {
                 if let IbcEvent::DistributeFeePacket(dist) = &event {
                     // Only record rewarded fees
                     if let DistributionType::Reward = dist.distribution_type {
@@ -36,8 +38,8 @@ pub fn extract_events(
     Ok(events_with_height)
 }
 
-fn should_collect_event(e: &IbcEvent) -> bool {
-    event_is_type_packet(e)
+fn should_collect_event(e: &IbcEvent, ignore_port_channel: Vec<PortChannelId>) -> bool {
+    event_is_type_packet(e, ignore_port_channel)
         || event_is_type_channel(e)
         || event_is_type_connection(e)
         || event_is_type_client(e)
@@ -45,7 +47,16 @@ fn should_collect_event(e: &IbcEvent) -> bool {
         || event_is_type_cross_chain_query(e)
 }
 
-fn event_is_type_packet(ev: &IbcEvent) -> bool {
+fn event_is_type_packet(ev: &IbcEvent, ignore_port_channel: Vec<PortChannelId>) -> bool {
+    if matches!(ev, IbcEvent::AcknowledgePacket(_)) {
+        if ignore_port_channel.iter().any(|pcid| {
+            pcid.channel_id.as_str() == ev.packet().unwrap().destination_channel.as_str()
+                && pcid.port_id.as_str() == ev.packet().unwrap().destination_port.as_str()
+        }) {
+            return false;
+        }
+    }
+
     matches!(
         ev,
         IbcEvent::SendPacket(_)

@@ -154,6 +154,7 @@ fn subscribe(
         compat_mode,
         *batch_delay,
         rt,
+        chain_config.ignore_port_channel.clone(),
     )
     .map_err(|e| eyre!("could not initialize event source: {}", e))?;
 
