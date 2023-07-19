@@ -300,6 +300,7 @@ impl CosmosSdkChain {
             self.compat_mode,
             self.config.batch_delay,
             self.rt.clone(),
+            self.config.ignore_port_channel.clone(),
         )
         .map_err(Error::event_monitor)?;
 

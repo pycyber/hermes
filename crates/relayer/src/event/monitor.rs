@@ -18,7 +18,9 @@ use tendermint_rpc::{
 };
 
 use ibc_relayer_types::{
-    core::ics02_client::height::Height, core::ics24_host::identifier::ChainId, events::IbcEvent,
+    core::ics02_client::height::Height,
+    core::ics24_host::identifier::{ChainId, PortChannelId},
+    events::IbcEvent,
 };
 
 use crate::{
@@ -128,6 +130,7 @@ pub struct EventMonitor {
     subscriptions: Box<SubscriptionStream>,
     /// Tokio runtime
     rt: Arc<TokioRuntime>,
+    ignore_port_channel: Vec<PortChannelId>,
 }
 
 // TODO: These are SDK specific, should be eventually moved.
@@ -141,7 +144,7 @@ pub mod queries {
             ibc_client(),
             ibc_connection(),
             ibc_channel(),
-            ibc_query(),
+            ibc_wasm(),
             // This will be needed when we send misbehavior evidence to full node
             // Query::eq("message.module", "evidence"),
         ]
@@ -166,6 +169,10 @@ pub mod queries {
     pub fn ibc_query() -> Query {
         Query::eq("message.module", "interchainquery")
     }
+
+    pub fn ibc_wasm() -> Query {
+        Query::eq("message.module", "wasm")
+    }
 }
 
 impl EventMonitor {
@@ -182,6 +189,7 @@ impl EventMonitor {
         rpc_compat: CompatMode,
         batch_delay: Duration,
         rt: Arc<TokioRuntime>,
+        ignore_port_channel: Vec<PortChannelId>,
     ) -> Result<(Self, TxMonitorCmd)> {
         let event_bus = EventBus::new();
         let (tx_cmd, rx_cmd) = channel::unbounded();
@@ -212,6 +220,7 @@ impl EventMonitor {
             ws_url,
             rpc_compat,
             subscriptions: Box::new(futures::stream::empty()),
+            ignore_port_channel,
         };
 
         Ok((monitor, TxMonitorCmd(tx_cmd)))
@@ -381,7 +390,12 @@ impl EventMonitor {
             core::mem::replace(&mut self.subscriptions, Box::new(futures::stream::empty()));
 
         // Convert the stream of RPC events into a stream of event batches.
-        let batches = stream_batches(subscriptions, self.chain_id.clone(), self.batch_delay);
+        let batches = stream_batches(
+            subscriptions,
+            self.chain_id.clone(),
+            self.batch_delay,
+            self.ignore_port_channel.clone(),
+        );
 
         // Needed to be able to poll the stream
         pin_mut!(batches);
@@ -462,8 +476,10 @@ impl EventMonitor {
 fn collect_events(
     chain_id: &ChainId,
     event: RpcEvent,
+    ignore_port_channel: &Vec<PortChannelId>,
 ) -> impl Stream<Item = Result<IbcEventWithHeight>> {
-    let events = crate::event::rpc::get_all_events(chain_id, event).unwrap_or_default();
+    let events =
+        crate::event::rpc::get_all_events(chain_id, event, ignore_port_channel).unwrap_or_default();
     stream::iter(events).map(Ok)
 }
 
@@ -472,6 +488,7 @@ fn stream_batches(
     subscriptions: Box<SubscriptionStream>,
     chain_id: ChainId,
     batch_delay: Duration,
+    ignore_port_channel: Vec<PortChannelId>,
 ) -> impl Stream<Item = Result<EventBatch>> {
     let id = chain_id.clone();
 
@@ -479,7 +496,7 @@ fn stream_batches(
     let events = subscriptions
         .map_ok(move |rpc_event| {
             trace!(chain = %id, "received an RPC event: {}", rpc_event.query);
-            collect_events(&id, rpc_event)
+            collect_events(&id, rpc_event, &ignore_port_channel)
         })
         .map_err(Error::canceled_or_generic)
         .try_flatten();

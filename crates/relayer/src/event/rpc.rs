@@ -7,7 +7,7 @@ use tendermint_rpc::{event::Event as RpcEvent, event::EventData as RpcEventData}
 use ibc_relayer_types::applications::ics31_icq::events::CrossChainQueryPacket;
 use ibc_relayer_types::core::ics02_client::{events as ClientEvents, height::Height};
 use ibc_relayer_types::core::ics04_channel::events as ChannelEvents;
-use ibc_relayer_types::core::ics24_host::identifier::ChainId;
+use ibc_relayer_types::core::ics24_host::identifier::{ChainId, PortChannelId};
 use ibc_relayer_types::events::IbcEvent;
 
 use crate::chain::cosmos::types::events::channel::RawObject;
@@ -119,6 +119,7 @@ use super::{ibc_event_try_from_abci_event, IbcEventWithHeight};
 pub fn get_all_events(
     chain_id: &ChainId,
     result: RpcEvent,
+    ignore_port_channel: &[PortChannelId],
 ) -> Result<Vec<IbcEventWithHeight>, String> {
     let mut events_with_height: Vec<IbcEventWithHeight> = vec![];
     let RpcEvent {
@@ -161,11 +162,31 @@ pub fn get_all_events(
                     {
                         tracing::trace!("extracted ibc_connection event {}", ibc_event);
                         events_with_height.push(IbcEventWithHeight::new(ibc_event, height));
-                    } else if query == queries::ibc_channel().to_string()
+                    } else if (query == queries::ibc_channel().to_string()
+                        || query == queries::ibc_wasm().to_string())
                         && event_is_type_channel(&ibc_event)
                     {
                         let _span = tracing::trace_span!("ibc_channel event").entered();
                         tracing::trace!("extracted {}", ibc_event);
+                        if matches!(ibc_event, IbcEvent::AcknowledgePacket(_)) {
+                            tracing::trace!(
+                                "AcknowledgePacket from chain_id: {} packet: {} ***",
+                                chain_id.to_string().as_str(),
+                                ibc_event.to_string()
+                            );
+                            if ignore_port_channel.iter().any(|pcid| {
+                                pcid.channel_id.as_str()
+                                    == ibc_event.packet().unwrap().destination_channel.as_str()
+                                    && pcid.port_id.as_str()
+                                        == ibc_event.packet().unwrap().destination_port.as_str()
+                            }) {
+                                tracing::trace!(
+                                    "**** skipping event {} ***",
+                                    ibc_event.to_string()
+                                );
+                                continue;
+                            }
+                        }
                         if matches!(ibc_event, IbcEvent::SendPacket(_)) {
                             // Should be the same as the hash of tx_result.tx?
                             if let Some(hash) =
@@ -175,6 +196,7 @@ pub fn get_all_events(
                             }
                         }
 
+                        tracing::trace!("pushing event {} ***", ibc_event.to_string());
                         events_with_height.push(IbcEventWithHeight::new(ibc_event, height));
                     } else if query == queries::ibc_query().to_string()
                         && event_is_type_cross_chain_query(&ibc_event)
