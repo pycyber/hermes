@@ -1,7 +1,6 @@
 use alloc::sync::Arc;
 use core::{
     fmt::{Display, Error as FmtError, Formatter},
-    ops::Deref,
     str::FromStr,
 };
 use std::thread;
