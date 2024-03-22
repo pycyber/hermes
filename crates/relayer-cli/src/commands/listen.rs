@@ -92,7 +92,7 @@ impl ListenCmd {
 impl Runnable for ListenCmd {
     fn run(&self) {
         self.cmd()
-            .unwrap_or_else(|e| fatal_error(app_reader().deref(), &*e));
+            .unwrap_or_else(|e| fatal_error(app_reader(), &*e));
     }
 }
 
